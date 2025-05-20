@@ -129,6 +129,7 @@ print(f"Train {len(train_df):,} | Val {len(val_df):,}")
 #%%
 np.random.seed(42)
 # Define the parameter grid for tree sizes
+
 param_grid = {
     'n_estimators': [2000],
     'max_depth': [5],
@@ -138,6 +139,17 @@ param_grid = {
     'scale_pos_weight': [3],
     'gamma': [ 0.3],
     'min_child_weight': [2],
+}
+
+param_grid = {
+    "n_estimators":       [1250, 1500, 1750],
+    "max_depth":          [5, 6],
+    "learning_rate":      [0.02, 0.03, 0.05],
+    "subsample":          [0.6, 0.7],
+    "colsample_bytree":   [0.7, 0.8],
+    "scale_pos_weight":   [3],
+    "gamma":              [0.2, 0.25, 0.3],
+    "min_child_weight":   [2],
 }
 
 search_model = XGBClassifier(
@@ -177,7 +189,6 @@ best_f1_score = grid_search.best_score_
 
 print(f"Best Parameters: {best_params}")
 print(f"Best F1 Score: {best_f1_score}")
-# Perform prediction on the validation set
 y_pred = grid_search.best_estimator_.predict(X_val)
 
 # Calculate F1 score and confusion matrix
@@ -192,54 +203,74 @@ print(f"Confusion Matrix on Validation Set:\n{cm}")
 # #### Inferenz on test dataset
 #%%
 TEST_CSV = "data_6_channels_test_pub.csv"
-OUT_CSV = "data_6_channels_test_pub_with_predictions.csv"
+OUT_NPY = "data_6_channels_test_pub_with_predictions.npy"
 MODEL_PKL = "models/xgb_iso_ensemble.pkl"
 
-# 6.1  Original-CSV laden (ohne Spaltenänderung merken)
+# 1) Original-Test-CSV einlesen (numerical_id bleibt erhalten)
 orig_test = pd.read_csv(TEST_CSV)
 
-# 6.2  Für das Modell temporär umbenennen
-tmp = (orig_test
-       .rename(columns={
-    "numerical_id": "forest_id",
-    "BLU": "blue", "GRN": "green", "RED": "red",
-    "NIR": "near_infrared", "SW1": "shortwave_infrared_1",
-    "SW2": "shortwave_infrared_2"})
-       .copy())
+# 2) Für Feature-Engineering Spalten umbenennen
+test_tmp = (
+    orig_test
+    .rename(columns={
+        "numerical_id": "forest_id",
+        "BLU": "blue",
+        "GRN": "green",
+        "RED": "red",
+        "NIR": "near_infrared",
+        "SW1": "shortwave_infrared_1",
+        "SW2": "shortwave_infrared_2",
+    })
+)
 
-# 6.3  Feature-Engineering
-test_feat = (tmp.groupby("forest_id")
-             .apply(engineer_features)
-             .fillna(method="ffill").fillna(method="bfill")
-             .reset_index(drop=True))
+# 3) Features berechnen
+test_feat = (
+    test_tmp
+    .groupby("forest_id", group_keys=False)
+    .apply(engineer_features)
+    .fillna(method="ffill").fillna(method="bfill")
+    .reset_index(drop=True)
+)
 
-# 6.4  Ensemble + Threshold laden
-with open(MODEL_PKL, "rb") as f:
-    art = pickle.load(f)
+# 4) Modell aus GridSearchCV verwenden
+best_model = grid_search.best_estimator_
 
-X_test = test_feat[art["feature_cols"]].values
-proba = sum(m.predict_proba(X_test)[:, 1] for m in art["models"]) / len(art["models"])
-pred = (proba >= art["threshold"]).astype(int)
+# 5) Wahrscheinlichkeiten und Prediktionen (mit Default-Threshold 0.5)
+X_test = test_feat[feature_cols].values
+proba = best_model.predict_proba(X_test)[:, 1]
+threshold = 0.5
+pred = (proba >= threshold).astype(int)
 
-# 6.5  Prediction-DataFrame zum Mergen vorbereiten
-pred_df = (test_feat[["forest_id", "year"]]
-           .assign(is_disturbance=pred)
-           .rename(columns={"forest_id": "numerical_id"}))
+# 6) Merge mit Original-IDs und Jahr
+pred_df = (
+    test_feat[["forest_id", "year"]]
+    .assign(is_disturbance=pred)
+    .rename(columns={"forest_id": "numerical_id"})
+)
 
-# 6.6  Mit Original-CSV zusammenführen  (inner-merge garantiert 1-zu-1)
-merged = (orig_test
-          .merge(pred_df, on=["numerical_id", "year"], how="left"))
+merged = orig_test.merge(
+    pred_df,
+    on=["numerical_id", "year"],
+    how="left"
+)
 
-# 6.7  Spaltenreihenfolge (wie Bild + neue Spalte)
-col_order = ["fid", "year", "numerical_id",
-             "BLU", "GRN", "RED", "NIR", "SW1", "SW2",
-             "is_disturbance"]
+# 7) Spaltenreihenfolge wie gewünscht
+col_order = [
+   # "fid", "year", "numerical_id",
+   # "BLU", "GRN", "RED", "NIR", "SW1", "SW2",
+    "is_disturbance"
+]
 merged = merged[col_order]
 
-# 6.8  Datei schreiben
-merged.to_csv(OUT_CSV, index=False)
-print(f"✓ '{OUT_CSV}' geschrieben – {merged.shape[0]:,} Zeilen")
+np.save(OUT_NPY, merged["is_disturbance"].to_numpy())
+print(
+    f"✓ '{OUT_NPY}' geschrieben – 0={(merged.is_disturbance == 0).sum():,} | "
+    f"1={(merged.is_disturbance == 1).sum():,}"
+)
 
-# 6.9  Kurzer Überblick
-print(f"Label-Verteilung: 0 = {(merged.is_disturbance == 0).sum():,}  |  "
-      f"1 = {(merged.is_disturbance == 1).sum():,}")
+#%%
+pred_loaded = np.load("data_6_channels_test_pub_with_predictions.npy")
+
+if pred_loaded.shape == (113424,): print('Shape is correct')
+else: print('Shape is incorrect')
+#%%
